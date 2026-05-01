@@ -1,1 +1,1 @@
-Devre yi koda bakarak tasarla 
+Devreyi koda bakarak tasarla 
