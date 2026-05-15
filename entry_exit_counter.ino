@@ -1,211 +1,83 @@
-// Çift HC-SR04 giriş/çıkış sayacı (Arduino Uno)
-// Sensör A (kapının dış tarafı): TRIG=2, ECHO=3
-// Sensör B (kapının iç tarafı) : TRIG=4, ECHO=5
-// Baud Rate: 9600
+#include <Wire.h> 
+#include <LiquidCrystal_I2C.h> // LCD Kütüphanesi [cite: 1764, 1830]
 
-// ---------------- Pinler ----------------
-const uint8_t TRIG_A = 2;
-const uint8_t ECHO_A = 3;
-const uint8_t TRIG_B = 4;
-const uint8_t ECHO_B = 5;
+// LCD Adresi genellikle 0x27'dir, 16 sütun 2 satır [cite: 1830]
+LiquidCrystal_I2C lcd(0x27, 16, 2); 
 
-// ---------------- Ayarlar ----------------
-const uint16_t MAX_DISTANCE_CM = 100;    // maksimum algılama mesafesi
-const uint16_t DETECT_THRESHOLD_CM = 50; // <50 cm => "algılandı"
+// Pin Tanımlamaları [cite: 1409, 1410, 1862, 1863, 1864]
+const int trigA = 2; const int echoA = 3; // Sensör A (Dış)
+const int trigB = 4; const int echoB = 5; // Sensör B (İç)
 
-const unsigned long SENSOR_SAMPLE_PERIOD_MS = 60;  // sensör örnekleme periyodu (çapraz etkiyi azaltır)
-const unsigned long SEQUENCE_WINDOW_MS = 800;       // A->B veya B->A bekleme penceresi
-const unsigned long LOCKOUT_MS = 1000;              // her sayımdan sonra minimum 1 saniye bekleme
-const unsigned long READY_PRINT_PERIOD_MS = 500;    // "sistem hazır" yazma periyodu
+// Ayarlanabilir Değerler (Threshold) [cite: 1818, 1819, 1820]
+const int ESIK_MESAFE = 80;    // Kapı genişliğine göre optimize edildi [cite: 1806, 1825]
+const int BEKLEME_MS = 1000;   // Sayımdan sonraki kilit süresi [cite: 1414, 1731, 1778]
+const int PENCERE_MS = 1200;   // İki sensör arası geçiş süresi 
 
-const unsigned long OVERLAP_IGNORE_MS = 150;        // iki sensör aynı anda aktifse bu süre dolunca ignore
-const unsigned long OVERLAP_COOLDOWN_MS = 300;      // ignore sonrası kısa soğuma (yalancı kenarları engeller)
-
-const uint8_t FILTER_CONSECUTIVE_HITS = 2;          // basit filtre: art arda N kez algılandıysa aktif
-
-// ---------------- Durum Makinesi ----------------
-enum State : uint8_t {
-  IDLE_READY = 0,
-  WAIT_B_AFTER_A,
-  WAIT_A_AFTER_B,
-  LOCKOUT
-};
-
-State state = IDLE_READY;
-long countPeople = 0;
-
-unsigned long stateStartMs = 0;
-unsigned long lockoutStartMs = 0;
-unsigned long lastSampleMs = 0;
-unsigned long lastReadyPrintMs = 0;
-
-bool nextSensorIsA = true;
-
-bool prevActiveA = false;
-bool prevActiveB = false;
-
-unsigned long bothActiveSinceMs = 0;
-unsigned long overlapIgnoreUntilMs = 0;
-
-// Basit filtre sayaçları
-uint8_t hitA = 0;
-uint8_t hitB = 0;
-
-uint16_t lastDistanceA = 999;
-uint16_t lastDistanceB = 999;
-
-uint16_t readDistanceCm(uint8_t trigPin, uint8_t echoPin) {
-  // HC-SR04 tetikleme
-  digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
-  digitalWrite(trigPin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
-
-  // 100 cm için ~5800us. Biraz pay bırakalım.
-  const unsigned long timeoutUs = 7000UL;
-  unsigned long duration = pulseIn(echoPin, HIGH, timeoutUs);
-
-  if (duration == 0) return 999; // timeout / ölçüm yok
-
-  // duration(us) / 58 ~= cm
-  uint16_t cm = (uint16_t)(duration / 58UL);
-  if (cm > MAX_DISTANCE_CM) return 999;
-  return cm;
-}
-
-bool updateFilteredActive(uint16_t distanceCm, uint8_t &hitCounter) {
-  bool rawActive = (distanceCm < DETECT_THRESHOLD_CM);
-  if (rawActive) {
-    if (hitCounter < 255) hitCounter++;
-  } else {
-    hitCounter = 0;
-  }
-  return (hitCounter >= FILTER_CONSECUTIVE_HITS);
-}
-
-void setState(State newState, unsigned long nowMs) {
-  state = newState;
-  stateStartMs = nowMs;
-}
+int mevcut = 0;
+unsigned long zamanAsimi;
 
 void setup() {
-  Serial.begin(9600);
-
-  pinMode(TRIG_A, OUTPUT);
-  pinMode(ECHO_A, INPUT);
-  pinMode(TRIG_B, OUTPUT);
-  pinMode(ECHO_B, INPUT);
-
-  digitalWrite(TRIG_A, LOW);
-  digitalWrite(TRIG_B, LOW);
-
-  setState(IDLE_READY, millis());
-  Serial.println("Sistem başlatıldı. Sistem hazır...");
+  Serial.begin(9600); // Seri port başlatma [cite: 1334, 1353, 1705]
+  lcd.init();         // LCD başlatma [cite: 1833]
+  lcd.backlight();    // Arka ışığı aç [cite: 1834]
+  
+  pinMode(trigA, OUTPUT); pinMode(echoA, INPUT);
+  pinMode(trigB, OUTPUT); pinMode(echoB, INPUT);
+  
+  lcd.setCursor(0, 0);
+  lcd.print("Sistem Hazir");
+  delay(2000);
+  ekranGuncelle();
 }
 
 void loop() {
-  unsigned long now = millis();
+  int mesafeA = mesafeOlc(trigA, echoA);
+  delay(50); // Sensörler arası sinyal karışmasını önler [cite: 1775]
+  int mesafeB = mesafeOlc(trigB, echoB);
 
-  // Periyodik sensör örnekleme (A/B sırayla)
-  if (now - lastSampleMs >= SENSOR_SAMPLE_PERIOD_MS) {
-    lastSampleMs = now;
-
-    if (nextSensorIsA) {
-      lastDistanceA = readDistanceCm(TRIG_A, ECHO_A);
-    } else {
-      lastDistanceB = readDistanceCm(TRIG_B, ECHO_B);
-    }
-    nextSensorIsA = !nextSensorIsA;
-  }
-
-  // Filtrelenmiş aktiflik
-  bool activeA = updateFilteredActive(lastDistanceA, hitA);
-  bool activeB = updateFilteredActive(lastDistanceB, hitB);
-
-  // Kenar tetikleme: sadece "aktif oldu" anını olay kabul ediyoruz
-  bool edgeA = (activeA && !prevActiveA);
-  bool edgeB = (activeB && !prevActiveB);
-
-  // Aynı anda iki sensör aktifse: anlık değil, belirli bir süre devam ederse ignore
-  if (state != LOCKOUT) {
-    if (activeA && activeB) {
-      if (bothActiveSinceMs == 0) bothActiveSinceMs = now;
-      if (now - bothActiveSinceMs >= OVERLAP_IGNORE_MS) {
-        overlapIgnoreUntilMs = now + OVERLAP_COOLDOWN_MS;
-        setState(IDLE_READY, now);
+  // GİRİŞ ALGORİTMASI: Önce A, sonra B [cite: 1393, 1412, 1866]
+  if (mesafeA < ESIK_MESAFE) {
+    zamanAsimi = millis();
+    while (millis() - zamanAsimi < PENCERE_MS) {
+      if (mesafeOlc(trigB, echoB) < ESIK_MESAFE) {
+        mevcut++;
+        ekranGuncelle();
+        delay(BEKLEME_MS); // Çift saymayı engeller [cite: 1414, 1868]
+        break;
       }
-    } else {
-      bothActiveSinceMs = 0;
     }
   }
 
-  bool overlapIgnoring = (overlapIgnoreUntilMs != 0 && now < overlapIgnoreUntilMs);
-
-  // Lockout: her sayımdan sonra 1 sn yeni sayım yok
-  if (state == LOCKOUT) {
-    if (now - lockoutStartMs >= LOCKOUT_MS) {
-      setState(IDLE_READY, now);
+  // ÇIKIŞ ALGORİTMASI: Önce B, sonra A [cite: 1394, 1413, 1867]
+  if (mesafeB < ESIK_MESAFE) {
+    zamanAsimi = millis();
+    while (millis() - zamanAsimi < PENCERE_MS) {
+      if (mesafeOlc(trigA, echoA) < ESIK_MESAFE) {
+        if (mevcut > 0) mevcut--;
+        ekranGuncelle();
+        delay(BEKLEME_MS);
+        break;
+      }
     }
-  } else {
-    if (!overlapIgnoring) {
-    switch (state) {
-      case IDLE_READY:
-        if (edgeA) {
-          setState(WAIT_B_AFTER_A, now);
-        } else if (edgeB) {
-          setState(WAIT_A_AFTER_B, now);
-        }
-        break;
-
-      case WAIT_B_AFTER_A:
-        // Pencere dolduysa iptal
-        if (now - stateStartMs > SEQUENCE_WINDOW_MS) {
-          setState(IDLE_READY, now);
-          break;
-        }
-        // A tetiklendikten sonra B tetiklenirse => GİRİŞ
-        if (edgeB) {
-          countPeople++;
-          Serial.print("Giriş yapıldı | Toplam: ");
-          Serial.println(countPeople);
-
-          lockoutStartMs = now;
-          setState(LOCKOUT, now);
-        }
-        break;
-
-      case WAIT_A_AFTER_B:
-        if (now - stateStartMs > SEQUENCE_WINDOW_MS) {
-          setState(IDLE_READY, now);
-          break;
-        }
-        // B tetiklendikten sonra A tetiklenirse => ÇIKIŞ
-        if (edgeA) {
-          if (countPeople > 0) countPeople--;
-          Serial.print("Çıkış yapıldı | Toplam: ");
-          Serial.println(countPeople);
-
-          lockoutStartMs = now;
-          setState(LOCKOUT, now);
-        }
-        break;
-
-      default:
-        setState(IDLE_READY, now);
-        break;
-    }
-    }
-  }
-
-  prevActiveA = activeA;
-  prevActiveB = activeB;
-
-  // Sürekli sistem hazır mesajı (spam olmaması için periyodik)
-  if (state == IDLE_READY && (now - lastReadyPrintMs >= READY_PRINT_PERIOD_MS)) {
-    lastReadyPrintMs = now;
-    Serial.print("Sistem hazır | Toplam: ");
-    Serial.println(countPeople);
   }
 }
 
+int mesafeOlc(int trig, int echo) {
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long sure = pulseIn(echo, HIGH, 20000); // Zaman aşımı eklendi [cite: 1700]
+  int mesafe = sure * 0.034 / 2;
+  if (mesafe == 0) return 999; // Hatalı ölçümü yoksay [cite: 1701]
+  return mesafe;
+}
+
+void ekranGuncelle() {
+  lcd.clear(); // [cite: 1844]
+  lcd.setCursor(0, 0);
+  lcd.print("SINIF MEVCUDU:"); // [cite: 1845]
+  lcd.setCursor(0, 1);
+  lcd.print(mevcut);
+  Serial.print("Guncel Mevcut: "); // [cite: 1846]
+  Serial.println(mevcut);
+}
